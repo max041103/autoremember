@@ -102,6 +102,7 @@ class Debtor {
     this.monthlyFixedInterest = 0.0,
     this.repayments = const [],
     this.interestEntries = const [],
+    this.lastInterestDate,
   });
 
   final String id;
@@ -113,6 +114,7 @@ class Debtor {
   double monthlyFixedInterest; // 模式 B：每月固定利息金额
   List<Repayment> repayments;
   List<InterestEntry> interestEntries;
+  DateTime? lastInterestDate; // 上次计息截止日期，作为下次计息的起点
 
   /// 已还本金总额
   double get repaidPrincipal =>
@@ -142,6 +144,8 @@ class Debtor {
       'monthlyFixedInterest': monthlyFixedInterest,
       'repayments': repayments.map((r) => r.toJson()).toList(),
       'interestEntries': interestEntries.map((e) => e.toJson()).toList(),
+      if (lastInterestDate != null)
+        'lastInterestDate': lastInterestDate!.toIso8601String(),
     };
   }
 
@@ -185,6 +189,8 @@ class Debtor {
                   InterestEntry.fromJson(Map<String, dynamic>.from(e)))
               .toList() ??
           [],
+      lastInterestDate:
+          DateTime.tryParse(json['lastInterestDate'] as String? ?? ''),
     );
   }
 }
@@ -1075,67 +1081,74 @@ class _DebtorDetailPageState extends State<DebtorDetailPage> {
     final now = DateTime.now();
     bool changed = false;
 
+    // 确定计息起点：优先使用 lastInterestDate，退化到 borrowDate
+    final interestBaseDate = _debtor.lastInterestDate ?? _debtor.borrowDate;
+
     if (_debtor.interestMode == InterestMode.daily &&
         _debtor.annualRate > 0 &&
         _debtor.remainingPrincipal > 0) {
-      final lastInterestDate = _debtor.interestEntries.isEmpty
-          ? _debtor.borrowDate
-          : _debtor.interestEntries
-              .map((e) => e.date)
-              .reduce((a, b) => a.isAfter(b) ? a : b);
-
-      if (lastInterestDate.isBefore(now)) {
-        final days = now.difference(lastInterestDate).inDays;
-        if (days >= 1) {
-          for (int d = 0; d < days; d++) {
-            final calcDate = lastInterestDate.add(Duration(days: d + 1));
-            final interest = calcDailyInterest(
-              _debtor.remainingPrincipal,
-              _debtor.annualRate,
-              lastInterestDate.add(Duration(days: d)),
-              calcDate,
-            );
-            if (interest > 0) {
-              _debtor.interestEntries.add(InterestEntry(
-                id: '${DateTime.now().microsecondsSinceEpoch.toString()}_$d',
-                amount: interest,
-                description: '按日计息（${_debtor.annualRate}%年利率）',
-                date: calcDate,
-              ));
-              changed = true;
-            }
-          }
+      // 模式 A：从 interestBaseDate 逐日计算到 now
+      DateTime cursor = interestBaseDate;
+      while (cursor.isBefore(now)) {
+        final nextDate = cursor.add(const Duration(days: 1));
+        if (nextDate.isAfter(now)) break;
+        final interest = calcDailyInterest(
+          _debtor.remainingPrincipal,
+          _debtor.annualRate,
+          cursor,
+          nextDate,
+        );
+        if (interest > 0) {
+          _debtor.interestEntries.add(InterestEntry(
+            id: DateTime.now().microsecondsSinceEpoch.toString(),
+            amount: interest,
+            description: '按日计息（${_debtor.annualRate}%年利率）',
+            date: nextDate,
+          ));
+          changed = true;
         }
+        cursor = nextDate;
+      }
+      // 状态展期：推进计息基准日期到 cursor
+      if (cursor.isAfter(interestBaseDate)) {
+        _debtor.lastInterestDate = cursor;
+        changed = true;
       }
     } else if (_debtor.interestMode == InterestMode.monthly &&
         _debtor.monthlyFixedInterest > 0 &&
         _debtor.remainingPrincipal > 0) {
-      final missing = calcMonthlyInterestCount(
-        _debtor.borrowDate,
-        _debtor.monthlyFixedInterest,
-        _debtor.interestEntries.length,
-      );
-      if (missing > 0) {
-        for (int i = 0; i < missing; i++) {
-          final month =
-              _debtor.borrowDate.month + _debtor.interestEntries.length + i;
-          final year = _debtor.borrowDate.year + (month - 1) ~/ 12;
-          final m = ((month - 1) % 12) + 1;
-          final day = _debtor.borrowDate.day;
-          final maxDay = DateTime(year, m + 1, 0).day;
-          final safeDay = day > maxDay ? maxDay : day;
-          final dueDate = DateTime(year, m, safeDay);
-
-          if (dueDate.isAfter(now)) break;
-
-          _debtor.interestEntries.add(InterestEntry(
-            id: '${DateTime.now().microsecondsSinceEpoch.toString()}_m$i',
-            amount: _debtor.monthlyFixedInterest,
-            description: '月固定利息 ${money(_debtor.monthlyFixedInterest)}',
-            date: dueDate,
-          ));
-          changed = true;
+      // 模式 B：从 interestBaseDate 逐月生成利息，直到超过 now
+      DateTime cursor = interestBaseDate;
+      DateTime? lastGeneratedDate;
+      while (true) {
+        // 计算下一个月的同一天
+        final nextMonth = DateTime(cursor.year, cursor.month + 1, cursor.day);
+        // 处理月末日期溢出（如 1月31日 → 2月28日）
+        DateTime dueDate;
+        if (nextMonth.day == cursor.day) {
+          dueDate = nextMonth;
+        } else {
+          // 日期溢出，使用该月最后一天
+          dueDate = DateTime(cursor.year, cursor.month + 2, 0);
         }
+
+        if (dueDate.isAfter(now)) break;
+
+        _debtor.interestEntries.add(InterestEntry(
+          id: DateTime.now().microsecondsSinceEpoch.toString(),
+          amount: _debtor.monthlyFixedInterest,
+          description: '月固定利息 ${money(_debtor.monthlyFixedInterest)}',
+          date: dueDate,
+        ));
+        lastGeneratedDate = dueDate;
+        changed = true;
+        cursor = dueDate;
+      }
+      // 状态展期：推进计息基准日期到最后一次生成利息的日期
+      if (lastGeneratedDate != null &&
+          lastGeneratedDate.isAfter(interestBaseDate)) {
+        _debtor.lastInterestDate = lastGeneratedDate;
+        changed = true;
       }
     }
 
@@ -1462,6 +1475,18 @@ class _DebtorDetailPageState extends State<DebtorDetailPage> {
                     Text(
                       '${formatDate(_debtor.borrowDate)} 借款',
                       style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                  if (_debtor.lastInterestDate != null &&
+                      _debtor.interestMode != InterestMode.manual)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 2),
+                      child: Text(
+                        '计息基准日期：${formatDate(_debtor.lastInterestDate!)}',
+                        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                              fontWeight: FontWeight.w600,
+                              color: const Color(0xff287d6f),
+                            ),
+                      ),
                     ),
                 ],
               ),
