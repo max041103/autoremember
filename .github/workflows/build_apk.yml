@@ -5,6 +5,10 @@ on:
     branches:
       - main
 
+# 必须显式声明权限，否则 GitHub Actions 无法自动创建 Release
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -30,8 +34,15 @@ jobs:
       - name: Build APK
         run: flutter build apk --release --no-tree-shake-icons
 
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      # 核心变动：将打包好的 APK 自动发布到 Releases
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: autoremember-app-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          tag_name: v1.0.${{ github.run_number }} # 基于运行次数自动生成版本号，例如 v1.0.2
+          name: Release v1.0.${{ github.run_number }}
+          body: |
+            自动编译构建的最新版安装包。
+            提交信息: ${{ github.event.head_commit.message }}
+          draft: false
+          prerelease: false
+          files: build/app/outputs/flutter-apk/app-release.apk # 把打包好的 apk 塞进 Release 附件
